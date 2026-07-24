@@ -2,6 +2,7 @@
 
 from cmath import phase
 import re
+from datetime import datetime, timezone
 
 from typer import prompt
 
@@ -91,9 +92,6 @@ from config import SIMILARITY_THRESHOLD, ENABLE_DATABASE
 
 # Defense-in-depth: the CLINICAL PLANNER block in build_combined_prompt
 # is internal metadata the model should never echo (see prompt_builder.py).
-# The prompt instructs it not to, but a local LLM can still slip
-# occasionally — this strips any leaked "Planner Decision" style block
-# out of the final answer before it ever reaches the user.
 # Defense-in-depth: the CLINICAL PLANNER block in build_combined_prompt
 # is internal metadata the model should never echo (see prompt_builder.py).
 # The prompt instructs it not to, but a local LLM can still slip
@@ -118,6 +116,21 @@ _PLANNER_LEAK_PATTERNS = [
     ),
     re.compile(
         r"next\s+required\s+field\s*:?\s*(?:[\"'][a-z_]+[\"'])?\.?", re.IGNORECASE
+    ),
+    # e.g. "That's not a medical question. However, ..." — self-
+    # contradictory hallucination, since this code path only runs when
+    # the message WAS already classified as medical/platform-related.
+    re.compile(
+        r"that'?s?\s+not\s+(?:a\s+)?medical\s+question\.?\s*", re.IGNORECASE
+    ),
+    re.compile(
+        r"this\s+(?:is|isn'?t|is\s+not)\s+(?:a\s+)?medical\s+question\.?\s*", re.IGNORECASE
+    ),
+    # e.g. "Here is a possible response from WaslaBot:" — meta-
+    # commentary narrating the model's own reply instead of just
+    # giving it.
+    re.compile(
+        r"here'?s?\s+(?:is\s+)?a\s+possible\s+response\s+from\s+wasla\s*bot\s*:?\s*", re.IGNORECASE
     ),
 ]
 
@@ -324,7 +337,15 @@ def _build_top_rated_answer(specialists):
 
 
 _LIST_SPECIALISTS_RE = re.compile(
-    r"\blist\b|\bshow me\b|\branked?\b|\bsorted\b|\ball\b.{0,15}\b(doctors?|specialists?)\b",
+    r"\blist\b|\bshow me\b|\branked?\b|\bsorted\b"
+    r"|\ball\b.{0,15}\b(doctors?|specialists?|drs?|docs?)\b"
+    # plural noun ("drs"/"docs"/"doctors"/"specialists") anywhere near
+    # "top"/"highest"/"best" — e.g. "what are the top drs", "top rated
+    # doctors" — plural wording means the user wants several, not one.
+    r"|\b(top|highest|best)\b.{0,20}\b(doctors|specialists|drs|docs)\b"
+    r"|\b(doctors|specialists|drs|docs)\b.{0,20}\b(top|highest|best)\b"
+    # explicit plural correction — "i asked for doctors not doctor"
+    r"|\b(doctors|specialists|drs|docs)\b.{0,15}\bnot\b.{0,15}\b(a\s+|one\s+)?(doctor|specialist|dr)\b",
     re.IGNORECASE
 )
 
@@ -349,6 +370,92 @@ def _build_specialist_list_answer(specialists):
     )
 
     return f"Here are the {specialization} specialists, from highest to lowest rated:\n{lines}"
+
+
+def _appointment_datetime(appt):
+    """
+    Returns a timezone-aware datetime for an appointment record, or
+    None if the date is missing/unparseable. Handles both real
+    datetime objects and ISO-formatted strings from Mongo.
+    """
+
+    date = appt.get("date")
+
+    if isinstance(date, datetime):
+        return date if date.tzinfo else date.replace(tzinfo=timezone.utc)
+
+    if isinstance(date, str):
+        try:
+            parsed = datetime.fromisoformat(date.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    return None
+
+
+def _build_appointments_answer(appointments):
+    """
+    Builds the "what are my appointments" answer directly from the
+    data, splitting upcoming vs past by comparing each appointment's
+    actual date to now — instead of asking the LLM to reason about
+    dates from formatted text, which produced self-contradictory
+    answers like "you have no upcoming appointments... however, you
+    have an appointment on February 10th" in the same reply.
+    """
+
+    if not appointments:
+        return "You have no appointments on record yet."
+
+    now = datetime.now(timezone.utc)
+    upcoming, past, undated = [], [], []
+
+    for appt in appointments:
+        dt = _appointment_datetime(appt)
+
+        if dt is None:
+            undated.append(appt)
+        elif dt >= now:
+            upcoming.append(appt)
+        else:
+            past.append(appt)
+
+    def _line(appt):
+        name = _display_name(appt.get("specialistName") or "Unknown doctor")
+        dt = _appointment_datetime(appt)
+        date_text = dt.strftime("%d %B %Y at %I:%M %p") if dt else "an unspecified date"
+        appt_type = appt.get("type", "consultation")
+        status = appt.get("status")
+        status_text = f", {status}" if status else ""
+        return f"- **{name}** — {date_text} ({appt_type}{status_text})"
+
+    parts = []
+
+    if upcoming:
+        upcoming.sort(key=_appointment_datetime)
+        plural = "s" if len(upcoming) != 1 else ""
+        parts.append(
+            f"You have {len(upcoming)} upcoming appointment{plural}:\n"
+            + "\n".join(_line(a) for a in upcoming)
+        )
+    else:
+        parts.append("You have no upcoming appointments scheduled.")
+
+    if past:
+        past.sort(key=_appointment_datetime, reverse=True)
+        plural = "s" if len(past) != 1 else ""
+        parts.append(
+            f"Past appointment{plural} on record:\n"
+            + "\n".join(_line(a) for a in past)
+        )
+
+    if undated:
+        parts.append(
+            "Additional appointment record(s) with no clear date:\n"
+            + "\n".join(_line(a) for a in undated)
+        )
+
+    return "\n\n".join(parts)
 
 
 _COMPARISON_RE = re.compile(
@@ -401,8 +508,11 @@ def _handle_book_guidance(user_query, chat_id):
     # every single time this is asked.
     if _HOW_TO_BOOK_RE.search(user_query):
         return (
-            "To book an appointment: open the specialist's profile page and use "
-            "the **Book Appointment** button to pick an available date and time.\n\n"
+            "To book an appointment: open the specialist's profile page "
+            "(from the Doctors list) and use the **Book Appointment** "
+            "button there to pick an available date and time. You can "
+            "also reach your upcoming and past appointments from your "
+            "own Patient Profile page.\n\n"
             "- Which specialty are you looking for? I can help you find a doctor to book with."
         )
 
@@ -439,8 +549,11 @@ def _handle_book_guidance(user_query, chat_id):
             mark_offer_fulfilled(chat_id, name, "available_times")
 
         answer = (
-            f"Great choice — open **{_display_name(name)}**'s profile and use the "
-            f"**Book Appointment** button to pick a date and time.{slot_text}"
+            f"Great choice — open **{_display_name(name)}**'s profile "
+            f"(from the Doctors list) and use the **Book Appointment** "
+            f"button there to pick a date and time. You can also view "
+            f"this booking afterward from your own Patient Profile "
+            f"page.{slot_text}"
         )
 
         return answer + _next_offer_line(chat_id, name)
@@ -461,8 +574,10 @@ def _handle_book_guidance(user_query, chat_id):
 
     answer = (
         f"Here are the top-rated {specialization} specialists:\n{lines}\n\n"
-        "Once you've picked one, open their profile and use the **Book "
-        "Appointment** button to choose an available date and time."
+        "Once you've picked one, open their profile from the Doctors "
+        "list and use the **Book Appointment** button there to choose "
+        "an available date and time. You can also view your bookings "
+        "afterward from your own Patient Profile page."
     )
 
     return answer + _next_offer_line(chat_id, top_name)
@@ -799,12 +914,11 @@ def predict(user_query, chat_id="default_session"):
             if planner and planner["field"]:
                 set_expected_answer(chat_id, planner["field"])
 
-            if followup_guidance:
                 question_text = get_followup_question(chat_id, planner)
 
                 if question_text:
                     answer = _strip_trailing_questions(answer)
-                    answer = f"{answer.rstrip()}\n\n{question_text}"
+                    answer = f"{answer.rstrip()}\n\n- {question_text}"
         
         except Exception as e:
             print("Chitchat Error:", e)
@@ -851,13 +965,14 @@ def predict(user_query, chat_id="default_session"):
     user_context = None
     context_specialist_name = None
     context_specialists = None
+    context_appointments = None
     user_id = None
 
     if ENABLE_DATABASE:
         user_id = get_user(chat_id)
 
         try:
-            user_context, context_specialist_name, context_specialists = get_user_context(
+            user_context, context_specialist_name, context_specialists, context_appointments = get_user_context(
                 processed_query, user_id, chat_id
             )
         except Exception as e:
@@ -874,7 +989,7 @@ def predict(user_query, chat_id="default_session"):
                 "Unfortunately, you need to be logged in to access "
                 "your account and platform data. Please log in to "
                 "view this information.\n\n"
-                "Would you like to know how to log in?"
+                "- Would you like to know how to log in?"
             )
 
             set_pending_login_offer(chat_id)
@@ -888,6 +1003,24 @@ def predict(user_query, chat_id="default_session"):
                 "confidence": 1.0
             }
 
+        # "what are my appointments" — build the upcoming/past split
+        # deterministically from the real dates, instead of letting the
+        # LLM reason about dates from formatted text (it has produced
+        # self-contradictory answers like "no upcoming appointments...
+        # however you have one on February 10th" in the same reply).
+        if context_appointments is not None:
+
+            answer = _build_appointments_answer(context_appointments)
+
+            add_message(chat_id, "assistant", answer)
+            set_waiting_for_reply(chat_id, assistant_is_waiting(answer))
+
+            return {
+                "answer": answer,
+                "sources": ["MongoDB"],
+                "confidence": 1.0
+            }
+
         # "list the cardiologists from top to lowest" — a readable
         # bulleted ranking, not a single pick. Checked before the
         # single-winner case below since "list ... top to lowest" would
@@ -895,7 +1028,12 @@ def predict(user_query, chat_id="default_session"):
         if context_specialists and _LIST_SPECIALISTS_RE.search(processed_query):
 
             answer = _build_specialist_list_answer(context_specialists)
-            answer = _finalize_specialist_answer(answer, chat_id, context_specialist_name)
+            list_top_name = context_specialists[0].get("name")
+
+            if list_top_name:
+                set_last_specialist_name(chat_id, list_top_name)
+
+            answer = _finalize_specialist_answer(answer, chat_id, list_top_name)
 
             add_message(chat_id, "assistant", answer)
             set_waiting_for_reply(chat_id, assistant_is_waiting(answer))
@@ -913,7 +1051,12 @@ def predict(user_query, chat_id="default_session"):
         if context_specialists and _TOP_RATED_RE.search(processed_query):
 
             answer = _build_top_rated_answer(context_specialists)
-            answer = _finalize_specialist_answer(answer, chat_id, context_specialist_name)
+            top_rated_name = context_specialists[0].get("name")
+
+            if top_rated_name:
+                set_last_specialist_name(chat_id, top_rated_name)
+
+            answer = _finalize_specialist_answer(answer, chat_id, top_rated_name)
 
             add_message(chat_id, "assistant", answer)
             set_waiting_for_reply(chat_id, assistant_is_waiting(answer))
@@ -1052,13 +1195,13 @@ def predict(user_query, chat_id="default_session"):
 
     1. Briefly acknowledge the patient's latest reply.
     2. Clearly explain that the reported symptoms require immediate emergency medical care.
-    3. Give 3–5 brief, practical first-aid or self-care recommendations that are safe to follow while waiting for medical care or traveling to the emergency department.
-    4. Examples include:
-    - Avoid strenuous physical activity.
-    - Sit upright if breathing is difficult.
-    - Stay with another person if possible.
-    - Do not drive yourself if symptoms are severe.
-    - Call emergency services if symptoms worsen.
+    3. Give 3–5 brief, practical first-aid or self-care recommendations that are safe to follow while waiting for medical care or traveling to the emergency department, formatted as a NUMBERED LIST, one per line — for example:
+    1. Avoid strenuous physical activity.
+    2. Sit upright if breathing is difficult.
+    3. Stay with another person if possible.
+    4. Do not drive yourself if symptoms are severe.
+    5. Call emergency services if symptoms worsen.
+    4. Do NOT write these recommendations as inline prose or a single paragraph — always as a numbered list like the example above.
     5. Do NOT suggest home treatment instead of emergency care.
     6. Do NOT discuss diagnoses in detail.
     7. Do NOT ask further medical questions.
@@ -1106,7 +1249,7 @@ def predict(user_query, chat_id="default_session"):
 
             if question_text:
                 answer = _strip_trailing_questions(answer)
-                answer = f"{answer.rstrip()}\n\n{question_text}"
+                answer = f"{answer.rstrip()}\n\n- {question_text}"
 
         if phase != EMERGENCY:
             mark_causes_explained(chat_id)
