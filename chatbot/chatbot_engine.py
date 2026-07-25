@@ -14,9 +14,9 @@ from core.loader import initialize_model
 from core.classifier import classify_question
 
 from memory.question_planner import (
-    get_next_missing_information,
-    get_followup_guidance,
-    get_followup_question
+    check_emergency,
+    get_symptom_exploration_guidance,
+    detect_question_topic
 )
 
 from preprocessing.gibberish import is_gibberish
@@ -131,6 +131,13 @@ _PLANNER_LEAK_PATTERNS = [
     # giving it.
     re.compile(
         r"here'?s?\s+(?:is\s+)?a\s+possible\s+response\s+from\s+wasla\s*bot\s*:?\s*", re.IGNORECASE
+    ),
+    # e.g. "Known symptoms:\n- headache\n- age: 26 years" — the model
+    # copying the internal KNOWN SYMPTOMS context block verbatim into
+    # its reply instead of using it silently. Stops before any line
+    # containing "?" so it can never consume a real follow-up question.
+    re.compile(
+        r"known symptoms:\s*\n(?:(?!.*\?)\s*-[^\n]*\n?)+", re.IGNORECASE
     ),
 ]
 
@@ -350,13 +357,58 @@ _LIST_SPECIALISTS_RE = re.compile(
 )
 
 
-def _build_specialist_list_answer(specialists):
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
+}
+
+_SHOW_ALL_RE = re.compile(r"\ball\b|\bevery\b|\bentire\b", re.IGNORECASE)
+
+_REQUESTED_COUNT_RE = re.compile(
+    r"\btop\s+(\d{1,2}|" + "|".join(_NUMBER_WORDS) + r")\b"
+    r"|\b(\d{1,2}|" + "|".join(_NUMBER_WORDS) + r")\s+top\b",
+    re.IGNORECASE
+)
+
+# Default shown when the user asks for a ranking/list without naming
+# a specific count ("what are the top drs...") — showing the entire
+# ~50+ specialist list for an unqualified "top" question isn't useful
+# and isn't what "top" means; only an explicit "all"/"every" request
+# should return everything.
+_DEFAULT_LIST_COUNT = 5
+
+
+def _requested_specialist_count(user_query):
+    """
+    Returns the number of specialists the user explicitly asked for
+    ("top 3", "3 top", "top five"), or None if no count was given.
+    """
+
+    match = _REQUESTED_COUNT_RE.search(user_query)
+
+    if not match:
+        return None
+
+    raw = match.group(1) or match.group(2)
+
+    if raw.isdigit():
+        return int(raw)
+
+    return _NUMBER_WORDS.get(raw.lower())
+
+
+def _build_specialist_list_answer(specialists, user_query=""):
     """
     "List the cardiologists from top to lowest" wants readable, scannable
     output, not one run-on sentence — reuse the same "- " bullet format
     used everywhere else in this pipeline (which the frontend already
     highlights consistently), built from the already-sorted data
     instead of asking the LLM to reproduce a ranked list faithfully.
+
+    Only returns as many entries as the user actually asked for ("top
+    3" -> 3), or a sensible default (5) when no count or "all"/"every"
+    was specified — showing the entire specialist list for an
+    unqualified "top" question isn't useful.
     """
 
     if not specialists:
@@ -364,12 +416,30 @@ def _build_specialist_list_answer(specialists):
 
     specialization = specialists[0].get("specialization") or "matching"
 
+    requested_count = _requested_specialist_count(user_query)
+
+    if requested_count:
+        shown = specialists[:requested_count]
+    elif _SHOW_ALL_RE.search(user_query):
+        shown = specialists
+    else:
+        shown = specialists[:_DEFAULT_LIST_COUNT]
+
     lines = "\n".join(
         f"- **{_display_name(doc.get('name') or 'Unknown')}** — rating {doc.get('rating', 0)}/5"
-        for doc in specialists
+        for doc in shown
     )
 
-    return f"Here are the {specialization} specialists, from highest to lowest rated:\n{lines}"
+    answer = f"Here are the {specialization} specialists, from highest to lowest rated:\n{lines}"
+
+    if len(shown) < len(specialists):
+        remaining = len(specialists) - len(shown)
+        answer += (
+            f"\n\n- There are {remaining} more {specialization} specialists "
+            f"— want to see more, or all of them?"
+        )
+
+    return answer
 
 
 def _appointment_datetime(appt):
@@ -535,6 +605,20 @@ def _handle_book_guidance(user_query, chat_id):
 
     mentioned = _find_mentioned_specialist(user_query, matches)
 
+    # If the current message doesn't name anyone (e.g. a plain "yes
+    # please" confirming a prior "would you like the steps to book
+    # with Dr. X?" offer), fall back to whichever specialist is
+    # already the subject of this conversation, instead of treating it
+    # as a fresh, unscoped search and dumping the generic top-3 list.
+    if not mentioned:
+        last_name = get_last_specialist_name(chat_id)
+
+        if last_name:
+            mentioned = next(
+                (doc for doc in matches if doc.get("name") == last_name),
+                None
+            )
+
     if mentioned:
         name = mentioned.get("name", "the specialist")
         set_last_specialist_name(chat_id, name)
@@ -653,7 +737,7 @@ def predict(user_query, chat_id="default_session"):
     # -------------------------
     # save user message
     # -------------------------
-    add_message(chat_id, "user", user_query)
+    add_message(chat_id, "user", user_query, extraction_text=processed_query)
 
     # -------------------------
     # login-offer follow-up — deterministic, no LLM call
@@ -828,13 +912,14 @@ def predict(user_query, chat_id="default_session"):
         len(processed_query.split()) <= 12
         and (
             is_waiting_for_reply(chat_id)
-            # A medical conversation naturally continues with related
-            # follow-ups ("do I need to do anything in the meantime?")
-            # even after a wrap-up summary that didn't end in a literal
-            # question — don't lose that context and fall back to the
-            # context-blind classifier just because assistant_is_waiting
-            # happened to be False.
-            or get_last_question_type(chat_id) == "MEDICAL"
+            # A medical or database conversation naturally continues
+            # with related follow-ups ("do I need to do anything in
+            # the meantime?", "i said only top three why are you
+            # listing all?!") even after a reply that didn't end in a
+            # literal question — don't lose that context and fall back
+            # to the context-blind classifier just because
+            # assistant_is_waiting happened to be False.
+            or get_last_question_type(chat_id) in ("MEDICAL", "DATABASE")
         )
     )
 
@@ -918,17 +1003,6 @@ def predict(user_query, chat_id="default_session"):
             answer = generate_response(prompt)
             answer = _strip_leaked_planner_block(answer)
 
-            planner = get_next_missing_information(chat_id)
-
-            if planner and planner["field"]:
-                set_expected_answer(chat_id, planner["field"])
-
-                question_text = get_followup_question(chat_id, planner)
-
-                if question_text:
-                    answer = _strip_trailing_questions(answer)
-                    answer = f"{answer.rstrip()}\n\n- {question_text}"
-        
         except Exception as e:
             print("Chitchat Error:", e)
             answer = "Hello! How can I help you today?"
@@ -1036,7 +1110,7 @@ def predict(user_query, chat_id="default_session"):
         # otherwise also look like a "top rated" question.
         if context_specialists and _LIST_SPECIALISTS_RE.search(processed_query):
 
-            answer = _build_specialist_list_answer(context_specialists)
+            answer = _build_specialist_list_answer(context_specialists, processed_query)
             list_top_name = context_specialists[0].get("name")
 
             if list_top_name:
@@ -1167,22 +1241,13 @@ def predict(user_query, chat_id="default_session"):
     # =========================
     # FINAL PROMPT BUILD
     # =========================
-    
-    planner = get_next_missing_information(chat_id)
 
-    followup_guidance = None
+    is_emergency = check_emergency(chat_id)
 
-    if planner:
-        followup_guidance = get_followup_guidance(chat_id, planner)
-
-        if planner["priority"] == "emergency":
-            set_phase(chat_id, EMERGENCY)
-
-        elif planner["priority"] == "complete":
-            set_phase(chat_id, ENOUGH_INFORMATION)
-
-        else:
-            set_phase(chat_id, COLLECTING_SYMPTOMS)
+    if is_emergency:
+        set_phase(chat_id, EMERGENCY)
+    else:
+        set_phase(chat_id, COLLECTING_SYMPTOMS)
 
     conversation_state = get_conversation_state(chat_id)
 
@@ -1241,8 +1306,7 @@ def predict(user_query, chat_id="default_session"):
             history_buffer=history,
             symptom_summary=get_symptom_summary(chat_id),
             conversation_state=conversation_state,
-            planner=planner,
-            followup_guidance=followup_guidance,
+            symptom_guidance=get_symptom_exploration_guidance(chat_id),
             causes_already_explained=has_explained_causes(chat_id),
             user_context=user_context
         )
@@ -1251,16 +1315,19 @@ def predict(user_query, chat_id="default_session"):
         answer = generate_response(prompt)
         answer = _strip_leaked_planner_block(answer)
 
-        if planner and planner["field"] and phase != EMERGENCY:
-            set_expected_answer(chat_id, planner["field"])
+        if not is_emergency:
+            # No forced/guaranteed question anymore — the model fully
+            # drives what to ask. This just figures out what topic (if
+            # any) the model's own question was about, so a bare reply
+            # like "26" next turn can still be correctly attributed to
+            # age rather than left ambiguous.
+            topic = detect_question_topic(answer)
 
-            question_text = get_followup_question(chat_id, planner)
+            if topic:
+                set_expected_answer(chat_id, topic)
+            else:
+                clear_expected_answer(chat_id)
 
-            if question_text:
-                answer = _strip_trailing_questions(answer)
-                answer = f"{answer.rstrip()}\n\n- {question_text}"
-
-        if phase != EMERGENCY:
             mark_causes_explained(chat_id)
 
     except Exception as e:

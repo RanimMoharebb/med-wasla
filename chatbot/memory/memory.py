@@ -44,9 +44,18 @@ def get_history(chat_id):
     return "\n".join(history)
 
 
-def add_message(chat_id, role, text):
+def add_message(chat_id, role, text, extraction_text=None):
     """
     Adds a message to memory.
+
+    extraction_text: the text used for symptom/entity extraction
+    (defaults to `text` if not given). Callers that have already
+    spell-corrected the message should pass that corrected version
+    here — extraction (including safety-critical red-flag detection)
+    should not silently miss a match just because of a typo like
+    "diffeculty breathing" not matching "difficulty breathing".
+    The raw `text` is still what gets stored/displayed in the
+    conversation history, unaltered.
     """
 
     if chat_id not in chat_sessions:
@@ -58,8 +67,8 @@ def add_message(chat_id, role, text):
     })
 
     if role == "user":
-        update_symptoms(chat_id, text)
-        update_patient_entities(chat_id, text)
+        update_symptoms(chat_id, extraction_text or text)
+        update_patient_entities(chat_id, extraction_text or text)
 
     limit_history(chat_id)
 
@@ -283,14 +292,16 @@ def get_symptom_summary(chat_id):
 
 
 def is_patient_ready(chat_id):
-    from memory.question_planner import get_next_missing_information
+    """
+    NOTE: under the current architecture, there's no more rigid
+    "all required fields collected" signal — the LLM decides when it
+    has enough information to discuss causes. This just reflects
+    whether there's no active emergency, kept for any future caller
+    that still wants a simple readiness check.
+    """
+    from memory.question_planner import check_emergency
 
-    planner = get_next_missing_information(chat_id)
-
-    if planner and planner["field"]:
-        set_expected_answer(chat_id, planner["field"])
-
-    return planner["priority"] == "complete"
+    return not check_emergency(chat_id)
 
 def clear_patient_state(chat_id):
     patient_state.pop(chat_id, None)

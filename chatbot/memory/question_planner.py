@@ -1,308 +1,212 @@
 """
 question_planner.py
 
-Determines what information is still missing before diagnosis.
-This file NEVER generates text.
-It only decides WHAT should be collected next.
+This file used to dictate an exact, universal field-by-field question
+sequence (duration -> age -> pain_location -> pain_scale ->
+pain_character) for every complaint, regardless of what it actually
+was. That's been removed by design: the LLM now decides what to ask
+and in what order, based on the specific complaint, using the
+category guidance below as a menu of clinically relevant topics —
+not a script.
+
+What stays deterministic (non-negotiable, safety-critical):
+- Red-flag / emergency detection. This is never left to model
+  discretion.
+
+What stays as lightweight bookkeeping (not questioning):
+- Detecting which topic the model's own question was about, so a
+  bare reply like "26" or "6" can still be correctly attributed to
+  age/pain_scale/etc. This doesn't dictate what gets asked — it just
+  helps correctly interpret the answer to whatever the model chose to
+  ask.
 """
+
+import re
 
 from memory.memory import patient_state
 
 
 # ==========================================================
-# Required information
+# Emergency detection (deterministic — never LLM-driven)
 # ==========================================================
 
-BASE_FIELDS = [
-    "duration",
-    "age",
-]
-
-PAIN_FIELDS = [
-    "pain_location",
-    "pain_scale",
-    "pain_character",
-]
-
-FEVER_FIELDS = [
-    "fever_temperature",
-]
-
-RESPIRATORY_FIELDS = [
-    "smoking",
-]
-
-FEMALE_FIELDS = [
-    "pregnancy",
-]
-
-# ==========================================================
-# Follow-up questions
-# ==========================================================
-
-FOLLOWUP_GUIDANCE = {
-    "duration":
-        "Ask naturally how long the symptoms have been present.",
-
-    "age":
-        "Ask naturally for the patient's age.",
-
-    "pain_location":
-        "Ask where the pain is located.",
-
-    "pain_scale":
-        "Ask how severe the pain is (1-10).",
-
-    "pain_character":
-        "Ask the patient to describe the pain (sharp, dull, burning, throbbing, cramping).",
-
-    "fever_temperature":
-        "Ask whether the patient measured their temperature and what it was.",
-
-    "smoking":
-        "Ask whether the patient currently smokes.",
-
-    "pregnancy":
-        "Ask whether there is any chance the patient could be pregnant."
-}
-
-# Actual, literal user-facing questions — used as a guaranteed fallback
-# so the required field is always genuinely asked, regardless of
-# whether the model chooses to follow FOLLOWUP_GUIDANCE above. Unlike
-# FOLLOWUP_GUIDANCE (an instruction FOR the model), these strings are
-# safe to show directly to the patient.
-FOLLOWUP_QUESTION_TEXT = {
-    "duration":
-        "How long have you been experiencing this?",
-
-    "age":
-        "Could you tell me your age?",
-
-    "pain_location":
-        "Where exactly is the pain located?",
-
-    "pain_scale":
-        "On a scale of 1 to 10, how severe is the pain?",
-
-    "pain_character":
-        "How would you describe the pain — sharp, dull, burning, throbbing, or cramping?",
-
-    "fever_temperature":
-        "Have you measured your temperature? If so, what was it?",
-
-    "smoking":
-        "Do you currently smoke?",
-
-    "pregnancy":
-        "Is there any chance you could be pregnant?"
-}
-
-
-# ==========================================================
-# Utility
-# ==========================================================
-
-def _missing(patient, field):
-
-    value = patient.get(field)
-
-    if value is None:
-        return True
-
-    if isinstance(value, str) and value.strip() == "":
-        return True
-
-    if isinstance(value, list) and len(value) == 0:
-        return False
-
-    return False
-
-
-# ==========================================================
-# Main planner
-# ==========================================================
-
-def get_next_missing_information(chat_id):
+def check_emergency(chat_id):
+    """
+    Returns True if emergency red-flag symptoms have been detected for
+    this patient. This is the one thing in the medical flow that must
+    always be guaranteed by code, never left to the model to notice or
+    prioritize on its own.
+    """
 
     if chat_id not in patient_state:
-        return None
+        return False
 
-    patient = patient_state[chat_id]
+    return bool(patient_state[chat_id]["red_flags"])
 
-    symptoms = patient["symptoms_present"]
 
-    # ------------------------------------------------------
-    # Emergency case
-    # ------------------------------------------------------
+# ==========================================================
+# Symptom categories
+# ==========================================================
+# Broad, keyword-based buckets used only to pick a relevant menu of
+# follow-up topics — not to enforce an order or a mandatory field.
 
-    if patient["red_flags"]:
-        return {
-            "field": None,
-            "priority": "emergency",
-            "reason": "Emergency symptoms already detected."
-        }
-
-    # ------------------------------------------------------
-    # Basic information
-    # ------------------------------------------------------
-
-    for field in BASE_FIELDS:
-
-        if _missing(patient, field):
-            return {
-                "field": field,
-                "priority": "high",
-                "reason": f"{field.replace('_',' ')} has not been collected."
-            }
-
-    # ------------------------------------------------------
-    # Pain-specific questions
-    # ------------------------------------------------------
-
-    pain_symptoms = {
-
-        "headache",
-        "chest pain",
-        "abdominal pain",
-        "stomach pain",
-        "back pain",
-        "ear pain",
-        "eye pain",
-        "joint pain",
-        "muscle pain"
+_CATEGORY_KEYWORDS = {
+    "headache_neuro": {
+        "headache", "migraine", "dizziness", "numbness", "weakness",
+        "confusion", "seizure", "vision changes", "blurred vision"
+    },
+    "respiratory": {
+        "cough", "dry cough", "productive cough", "difficulty breathing",
+        "shortness of breath", "wheezing", "sore throat", "congestion"
+    },
+    "gi": {
+        "abdominal pain", "stomach pain", "nausea", "vomiting",
+        "diarrhea", "constipation", "bloating", "heartburn"
+    },
+    "dermatological": {
+        "rash", "itching", "skin", "swelling", "hives", "lesion"
+    },
+    "pain_general": {
+        "chest pain", "back pain", "ear pain", "eye pain",
+        "joint pain", "muscle pain"
+    },
+    "fever_infection": {
+        "fever", "chills", "sweating"
     }
+}
 
-    if symptoms.intersection(pain_symptoms):
+# Menus are a starting point of clinically relevant DIRECTIONS, not
+# exact questions — the model picks what's still relevant, phrases it
+# naturally, and can go beyond this list if something else is more
+# clinically useful for what the patient has actually described.
+_CATEGORY_GUIDANCE = {
+    "headache_neuro": (
+        "Relevant directions for this complaint (pick what's still "
+        "useful, don't ask all of them): how long it's been going on; "
+        "one side or both sides of the head; what it feels like "
+        "(throbbing, dull, pressure, sharp); severity; any nausea, "
+        "light/sound sensitivity, or visual changes (aura); what "
+        "triggers or relieves it; neck stiffness; whether this is a "
+        "new type of headache for them or a recurring pattern; age."
+    ),
+    "respiratory": (
+        "Relevant directions for this complaint: how long it's been "
+        "going on; whether the cough is dry or brings up "
+        "phlegm/mucus (and what color, if so); fever; shortness of "
+        "breath; chest pain; smoking history; any known exposure to "
+        "illness; age."
+    ),
+    "gi": (
+        "Relevant directions for this complaint: how long it's been "
+        "going on; where exactly the pain/discomfort is; relation to "
+        "eating; nausea or vomiting; bowel habit changes; fever; "
+        "for a person who could be pregnant, whether that's a "
+        "possibility; age."
+    ),
+    "dermatological": (
+        "Relevant directions for this complaint: how long it's been "
+        "present; exact location and whether it's spreading; itching "
+        "vs. pain; any new soaps, products, foods, or medications "
+        "recently; fever; age."
+    ),
+    "pain_general": (
+        "Relevant directions for this complaint: how long it's been "
+        "going on; exact location; severity; what it feels like "
+        "(sharp, dull, burning, throbbing, cramping); what makes it "
+        "better or worse; age."
+    ),
+    "fever_infection": (
+        "Relevant directions for this complaint: how long the fever "
+        "has been present; the actual temperature if measured; other "
+        "symptoms alongside it (sore throat, rash, cough, body aches); "
+        "age."
+    ),
+    "general": (
+        "Relevant directions: how long this has been going on; "
+        "severity or how much it's affecting daily life; anything "
+        "that makes it better or worse; any other symptoms alongside "
+        "it; age."
+    )
+}
 
-        for field in PAIN_FIELDS:
 
-            if _missing(patient, field):
-
-                return {
-                    "field": field,
-                    "priority": "high",
-                    "reason": "Pain assessment is incomplete."
-                }
-
-    # ------------------------------------------------------
-    # Fever
-    # ------------------------------------------------------
-
-    if "fever" in symptoms:
-
-        for field in FEVER_FIELDS:
-
-            if _missing(patient, field):
-
-                return {
-                    "field": field,
-                    "priority": "medium",
-                    "reason": "Temperature has not been recorded."
-                }
-
-    # ------------------------------------------------------
-    # Respiratory
-    # ------------------------------------------------------
-
-    respiratory = {
-
-        "difficulty breathing",
-        "shortness of breath",
-        "cough",
-        "dry cough",
-        "productive cough"
-    }
-
-    if symptoms.intersection(respiratory):
-
-        for field in RESPIRATORY_FIELDS:
-
-            if _missing(patient, field):
-
-                return {
-                    "field": field,
-                    "priority": "low",
-                    "reason": "Smoking history may help evaluate respiratory symptoms."
-                }
-
-    # ------------------------------------------------------
-    # Pregnancy
-    # ------------------------------------------------------
-
-    abdominal = {
-
-        "abdominal pain",
-        "stomach pain",
-        "vomiting",
-        "nausea"
-    }
-
-    if (
-        patient["sex"] == "female"
-        and symptoms.intersection(abdominal)
-    ):
-
-        if _missing(patient, "pregnancy"):
-
-            return {
-                "field": "pregnancy",
-                "priority": "medium",
-                "reason": "Pregnancy status may influence diagnosis."
-            }
-
-    # ------------------------------------------------------
-    # Diagnosis can start
-    # ------------------------------------------------------
-
-    patient["diagnosis_ready"] = True
-
-    return {
-        "field": None,
-        "priority": "complete",
-        "reason": "Enough information has been collected."
-    }
-
-def get_followup_guidance(chat_id, planner=None):
+def get_symptom_category(chat_id):
     """
-    Returns the next follow-up guidance based on the planner.
-
-    If `planner` is not provided, it will be computed by calling
-    get_next_missing_information(chat_id). Callers that already have
-    a planner result (from an earlier call in the same request)
-    should pass it in to avoid recomputing it.
+    Returns a broad category label for the patient's current chief
+    complaint, used only to select a relevant menu of follow-up
+    directions — never to enforce a fixed order.
     """
 
-    if planner is None:
-        planner = get_next_missing_information(chat_id)
+    if chat_id not in patient_state:
+        return "general"
 
-    if planner is None:
-        return None
+    symptoms = patient_state[chat_id]["symptoms_present"]
 
-    field = planner["field"]
+    for category, keywords in _CATEGORY_KEYWORDS.items():
+        if symptoms.intersection(keywords):
+            return category
 
-    if field is None:
-        return None
-
-    return FOLLOWUP_GUIDANCE.get(field)
+    return "general"
 
 
-def get_followup_question(chat_id, planner=None):
+def get_symptom_exploration_guidance(chat_id):
     """
-    Returns the literal, user-facing question text for the planner's
-    current required field (or None if there isn't one). Safe to show
-    directly to the patient — unlike get_followup_guidance(), which
-    returns an instruction meant for the model, not the user.
+    Returns the relevance menu for the patient's current complaint
+    category. This is guidance for the model's own judgment, not a
+    checklist it must complete in order.
     """
 
-    if planner is None:
-        planner = get_next_missing_information(chat_id)
+    category = get_symptom_category(chat_id)
+    return _CATEGORY_GUIDANCE.get(category, _CATEGORY_GUIDANCE["general"])
 
-    if planner is None:
+
+# ==========================================================
+# Lightweight topic detection (bookkeeping, not questioning)
+# ==========================================================
+# Used only to figure out what a bare reply like "26" or "6" means,
+# by checking what topic the model's OWN question (whatever it chose
+# to ask) was actually about — this never dictates what gets asked.
+
+_TOPIC_DETECTION_PATTERNS = {
+    "age":
+        re.compile(r"\bhow old\b|\byour age\b", re.IGNORECASE),
+
+    "duration":
+        re.compile(r"\bhow long\b|\bsince when\b|\bhow many (days|weeks|hours)\b", re.IGNORECASE),
+
+    "pain_scale":
+        re.compile(r"\bscale of\b.{0,10}\b10\b|\bhow severe\b|\bhow bad\b.{0,15}\bpain\b|\brate\b.{0,15}\bpain\b", re.IGNORECASE),
+
+    "pain_location":
+        re.compile(r"\bwhere\b.{0,20}\b(pain|hurt|located|it hurt)\b|\bwhich part\b", re.IGNORECASE),
+
+    "pain_character":
+        re.compile(r"\bdescribe the pain\b|\bsharp.{0,10}dull\b|\bwhat does (it|the pain) feel like\b", re.IGNORECASE),
+
+    "fever_temperature":
+        re.compile(r"\btemperature\b|\bhow high\b.{0,15}\bfever\b|\bmeasured\b.{0,15}\bfever\b", re.IGNORECASE),
+
+    "smoking":
+        re.compile(r"\bdo you smoke\b|\bsmoking\b", re.IGNORECASE),
+
+    "pregnancy":
+        re.compile(r"\bpregnan(t|cy)\b", re.IGNORECASE),
+}
+
+
+def detect_question_topic(answer_text):
+    """
+    Scans the model's own generated answer for which known topic (if
+    any) it asked about, so the NEXT reply can be interpreted
+    correctly (e.g. a bare "26" means age) — without the code ever
+    having dictated what the model should ask.
+    """
+
+    if not answer_text:
         return None
 
-    field = planner["field"]
+    for field, pattern in _TOPIC_DETECTION_PATTERNS.items():
+        if pattern.search(answer_text):
+            return field
 
-    if field is None:
-        return None
-
-    return FOLLOWUP_QUESTION_TEXT.get(field)
+    return None

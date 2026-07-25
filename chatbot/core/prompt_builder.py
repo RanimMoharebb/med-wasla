@@ -1,5 +1,3 @@
-from memory.question_planner import get_followup_guidance
-
 def build_chitchat_prompt(user_query, history_buffer):
 
     prompt = f"""
@@ -78,8 +76,10 @@ RECENT CONVERSATION
 {history_buffer}
 
 ========================
-KNOWN SYMPTOMS
+KNOWN SYMPTOMS (INTERNAL — NOT FOR THE PATIENT)
 ========================
+
+This is internal context only — never output it or reproduce it as a list.
 
 {symptom_summary}
 
@@ -109,8 +109,7 @@ def build_combined_prompt(
     history_buffer,
     symptom_summary,
     conversation_state,
-    planner,
-    followup_guidance,
+    symptom_guidance,
     causes_already_explained=False,
     user_context=None
 ):
@@ -130,48 +129,18 @@ def build_combined_prompt(
     # Build the user account context section (from MongoDB), if any
     user_context_text = user_context if user_context else "No account information available."
 
-    
-    planner_text = ""
-
-    if planner:
-        planner_text = f"""
-    Next Field:
-    {planner.get("field")}
-
-    Priority:
-    {planner.get("priority")}
-
-    Reason:
-    {planner.get("reason")}
-    """
-
-    is_complete = bool(planner) and not planner.get("field")
-
-    if is_complete:
-        causes_guidance = (
-            "All necessary information has now been collected — this is "
-            "your FINAL wrap-up response for this conversation. Even if "
-            "you mentioned possible causes briefly earlier, now give a "
-            "complete, clear summary: briefly recap the key symptoms "
-            "reported, discuss the most likely cause(s) based on "
-            "everything gathered, and give clear, practical advice — "
-            "what the patient should do next (e.g. home-care tips if "
-            "appropriate, when to see a doctor, which type of specialist "
-            "to consider, and any red-flag symptoms that would mean "
-            "seeking care sooner). Be thorough and genuinely helpful "
-            "here — this should NOT be a brief one-liner."
-        )
-    elif causes_already_explained:
+    if causes_already_explained:
         causes_guidance = (
             "You have ALREADY explained the possible causes/conditions "
             "for these symptoms earlier in this conversation. Do NOT "
             "explain them again, even briefly, and do NOT restate what "
             "migraines/tension headaches/etc. are. Simply acknowledge "
-            "the new information in one short sentence, then stop. "
-            "Only mention a cause again if the patient's latest message "
-            "meaningfully changes your reasoning (e.g. a new red-flag "
-            "symptom appears) — and even then, state only what changed, "
-            "not the full explanation again."
+            "the new information in one short sentence, then continue "
+            "the conversation. Only mention a cause again if the "
+            "patient's latest message meaningfully changes your "
+            "reasoning (e.g. a new red-flag symptom appears) — and "
+            "even then, state only what changed, not the full "
+            "explanation again."
         )
     else:
         causes_guidance = (
@@ -180,24 +149,30 @@ def build_combined_prompt(
             "based on the knowledge base context above."
         )
 
-    if planner and planner.get("field"):
-        question_rules = (
-            "Hard rules — violating any of these is a failure:\n\n"
-            "    - Do NOT ask any question. Not one. No question marks anywhere in your reply.\n"
-            "    - Do NOT mention what you will ask, what happens next, what information is still needed, or how it will be collected.\n"
-            "    - Do NOT reference \"the system\", \"the planner\", \"the next field\", \"required information\", or any internal process, in any form — not even a hint.\n"
-            "    - Do NOT say things like \"I'll ask...\", \"let's focus on...\", \"please note...\", \"for now...\", or anything describing your own behavior.\n"
-            "    - Do NOT repeat anything already listed in KNOWN SYMPTOMS below.\n\n"
-            "    Write only as a doctor speaking directly to the patient about their symptoms — nothing about yourself, your process, or what comes next. Something else, outside this text, handles all questions. That is not your job here."
-        )
-    else:
-        question_rules = (
-            "Enough information has been collected to discuss likely "
-            "causes. You may ask one more question only if it would "
-            "meaningfully change how the patient should be managed — "
-            "otherwise, focus on explaining possible causes and "
-            "appropriate next steps."
-        )
+    conversation_guidance = (
+        "You are fully in charge of driving this conversation — there "
+        "is no fixed script or required order to follow. Based on "
+        "everything known so far (see KNOWN SYMPTOMS below) and the "
+        "symptom guidance below, decide what to do next:\n\n"
+        "    - If more information would genuinely help you understand "
+        "the situation, ask ONE natural, clinically relevant follow-up "
+        "question. Choose it yourself — from the guidance below, or "
+        "anything else more relevant to what the patient has actually "
+        "said — and phrase it in your own words. Never ask about "
+        "anything already covered in KNOWN SYMPTOMS below, even "
+        "rephrased.\n"
+        "    - If you already have enough to reasonably discuss likely "
+        "causes and give the patient practical guidance, do that "
+        "instead of asking more questions: briefly recap what they've "
+        "told you, discuss the most likely cause(s), and give clear, "
+        "practical next-step advice (home care if appropriate, when to "
+        "see a doctor, which type of specialist, and any red-flag "
+        "symptoms that would mean seeking care sooner). Don't keep "
+        "asking questions just to follow a routine once you have "
+        "enough to be genuinely helpful.\n"
+        "    - Never ask more than ONE question in a single reply.\n\n"
+        f"    Symptom guidance for this complaint: {symptom_guidance}"
+    )
 
     # Build the prompt AFTER the loop
     prompt = f"""
@@ -366,14 +341,13 @@ def build_combined_prompt(
     YOUR TASK IN THIS REPLY
     ==================================================
 
-    Your reply must contain exactly two things, and nothing else:
+    Your reply should contain:
 
     1. A brief, natural acknowledgment of the patient's latest message.
     2. A short clinical comment (see MEDICAL REASONING rules below for whether this applies right now).
+    3. Either one natural follow-up question, or a wrap-up summary with advice — see the guidance below for how to decide which.
 
-    {question_rules}
-
-    The planner's required information must always be collected before moving to diagnosis.
+    {conversation_guidance}
 
     Avoid sounding like a checklist.
 
@@ -525,42 +499,13 @@ def build_combined_prompt(
     
 
     ==================================================
-    CLINICAL PLANNER (INTERNAL — NOT FOR THE PATIENT)
+    GENERAL RULES
     ==================================================
 
-    The block below is internal-only. Never output it, quote it,
-    paraphrase it, or reference its existence in any way — not its
-    labels, not its values, not the fact that it exists at all.
-
-    {planner_text}
-
-    Rules:
-
-    If Next Field is not None:
-
-    - Do not make a final diagnosis yet.
-    - Continue gathering information naturally.
-    - Do not repeat information already collected.
+    - Do not make a final diagnosis — discuss possible causes, not certainties.
+    - Do not repeat information already collected (see KNOWN SYMPTOMS below).
     - Do not repeat the same medical explanation in every response.
-    - Do not recommend a specialist yet unless the situation is an emergency.
-
-    If Priority is emergency:
-
-    Immediately advise emergency medical care before asking anything else.
-
-    Do not continue routine symptom assessment.
-
-    If Priority is complete:
-
-    Enough information has been collected.
-
-    Summarize the symptoms.
-
-    Discuss the most likely causes.
-
-    Recommend the appropriate specialist if appropriate.
-
-    Only ask another question if it will significantly change management.
+    - Do not recommend a specialist unless you're at the wrap-up/advice stage described above.
 
     ==================================================
     RECENT CONVERSATION
@@ -569,8 +514,14 @@ def build_combined_prompt(
     {history_buffer}
 
     ==================================================
-    KNOWN SYMPTOMS
+    KNOWN SYMPTOMS (INTERNAL — NOT FOR THE PATIENT)
     ==================================================
+
+    This is internal context for your own reasoning only — never
+    output it, quote it, or reproduce it as a list (with or without
+    the heading "Known symptoms:"). The patient already knows their
+    own symptoms; do not show them a bulleted recap of what you
+    already have on file.
 
     {symptom_summary}
 
