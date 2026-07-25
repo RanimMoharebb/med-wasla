@@ -825,8 +825,17 @@ def predict(user_query, chat_id="default_session"):
     history = get_history(chat_id)
 
     is_followup = (
-        is_waiting_for_reply(chat_id)
-        and len(processed_query.split()) <= 12
+        len(processed_query.split()) <= 12
+        and (
+            is_waiting_for_reply(chat_id)
+            # A medical conversation naturally continues with related
+            # follow-ups ("do I need to do anything in the meantime?")
+            # even after a wrap-up summary that didn't end in a literal
+            # question — don't lose that context and fall back to the
+            # context-blind classifier just because assistant_is_waiting
+            # happened to be False.
+            or get_last_question_type(chat_id) == "MEDICAL"
+        )
     )
 
     # -------------------------
