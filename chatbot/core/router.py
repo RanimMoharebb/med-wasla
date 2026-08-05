@@ -31,6 +31,8 @@ DATABASE_KEYWORDS = {
     "ratings",
     "doctor",
     "doctors",
+    "drs",
+    "docs",
     "nurse",
     "nurses",
     "specialist",

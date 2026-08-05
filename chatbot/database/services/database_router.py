@@ -61,6 +61,12 @@ def handle_database_query(user_query: str, user_id: str):
 
     if intent == "SPECIALISTS":
 
+        if not user_id:
+            return {
+                "type": "login_required",
+                "data": None
+            }
+
         specialization = extract_specialization(user_query)
 
         data = (

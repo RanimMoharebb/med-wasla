@@ -4,13 +4,15 @@ memory.py
 Conversation memory management.
 """
 
+from email.mime import text
 import re
 
 from models import chat_sessions
 
 from memory.session import (
     get_expected_answer,
-    clear_expected_answer
+    clear_expected_answer,
+    set_expected_answer
 )
 
 # from memory.question_planner import get_next_missing_information
@@ -42,9 +44,18 @@ def get_history(chat_id):
     return "\n".join(history)
 
 
-def add_message(chat_id, role, text):
+def add_message(chat_id, role, text, extraction_text=None):
     """
     Adds a message to memory.
+
+    extraction_text: the text used for symptom/entity extraction
+    (defaults to `text` if not given). Callers that have already
+    spell-corrected the message should pass that corrected version
+    here — extraction (including safety-critical red-flag detection)
+    should not silently miss a match just because of a typo like
+    "diffeculty breathing" not matching "difficulty breathing".
+    The raw `text` is still what gets stored/displayed in the
+    conversation history, unaltered.
     """
 
     if chat_id not in chat_sessions:
@@ -56,8 +67,8 @@ def add_message(chat_id, role, text):
     })
 
     if role == "user":
-        update_symptoms(chat_id, text)
-        update_patient_entities(chat_id, text)
+        update_symptoms(chat_id, extraction_text or text)
+        update_patient_entities(chat_id, extraction_text or text)
 
     limit_history(chat_id)
 
@@ -207,7 +218,13 @@ def update_symptoms(chat_id, text):
             # Workflow
             # =========================
 
-            "diagnosis_ready": False
+            "diagnosis_ready": False,
+
+            # Whether the possible-causes/differential explanation has
+            # already been given to the patient at least once. Used to
+            # stop the model from repeating the same explanation every
+            # single turn.
+            "causes_explained": False
         }
 
     lower = text.lower()
@@ -275,14 +292,36 @@ def get_symptom_summary(chat_id):
 
 
 def is_patient_ready(chat_id):
-    from memory.question_planner import get_next_missing_information
+    """
+    NOTE: under the current architecture, there's no more rigid
+    "all required fields collected" signal — the LLM decides when it
+    has enough information to discuss causes. This just reflects
+    whether there's no active emergency, kept for any future caller
+    that still wants a simple readiness check.
+    """
+    from memory.question_planner import check_emergency
 
-    planner = get_next_missing_information(chat_id)
-
-    return planner["priority"] == "complete"
+    return not check_emergency(chat_id)
 
 def clear_patient_state(chat_id):
     patient_state.pop(chat_id, None)
+
+
+def has_explained_causes(chat_id):
+    """
+    Returns True if the possible-causes/differential explanation has
+    already been given to this patient earlier in the conversation.
+    """
+    return patient_state.get(chat_id, {}).get("causes_explained", False)
+
+
+def mark_causes_explained(chat_id):
+    """
+    Marks that the possible-causes/differential explanation has now
+    been given, so future prompts know not to repeat it.
+    """
+    if chat_id in patient_state:
+        patient_state[chat_id]["causes_explained"] = True
 
 
 def _extract_number(text):
@@ -297,6 +336,12 @@ def update_patient_entities(chat_id, text):
     patient = patient_state[chat_id]
 
     expected = get_expected_answer(chat_id)
+    
+    print("=" * 60)
+    print("USER:", text)
+    print("EXPECTED:", expected)
+    print("CHAT ID:", chat_id)
+    print("=" * 60)
 
     # =====================================================
     # Handle expected answer first
@@ -337,7 +382,7 @@ def update_patient_entities(chat_id, text):
         # Temperature
         # -------------------------
 
-        elif expected == "temperature":
+        elif expected == "fever_temperature":
 
             match = re.search(
                 r"\b(3[5-9]|4[0-2])(\.\d)?\b",
@@ -358,9 +403,41 @@ def update_patient_entities(chat_id, text):
             value = re.search(r"\b(\d{1,3})\b", lower)
 
             if value:
-                patient["age"] = int(value.group(1))
+                age = int(value.group(1))
+
+                if 0 < age <= 120:
+                    patient["age"] = age
+                    print("AGE SAVED:", age)
+
+                    clear_expected_answer(chat_id)
+                    return
+
+        # -------------------------
+        # Pain Location
+        # -------------------------
+        # Free text — location descriptions vary too much for a fixed
+        # keyword list ("both sides", "left temple", "behind my eyes").
+        # Since we know this reply is specifically answering the
+        # pain-location question, trust it directly rather than trying
+        # to pattern-match it — UNLESS it clearly looks like a
+        # different topic (e.g. the user moved on to a database/
+        # website question), in which case the stale expectation is
+        # cleared instead of misfiling that text as a location.
+
+        elif expected == "pain_location":
+
+            from core.router import keyword_route
+
+            if keyword_route(text) is not None:
                 clear_expected_answer(chat_id)
-                return
+
+            else:
+                location_text = text.strip()
+
+                if location_text:
+                    patient["pain_location"] = location_text
+                    clear_expected_answer(chat_id)
+                    return
 
     # =====================================================
     # General extraction
@@ -406,15 +483,16 @@ def update_patient_entities(chat_id, text):
     # -------------------------
     # Age
     # -------------------------
-
     match = re.search(
         r"(i am|i'm|my age is|age is)\s+(\d{1,3})",
         lower
     )
 
     if match:
-        if patient["age"] is None:
-            patient["age"] = int(match.group(2))
+        age = int(match.group(2))
+
+        if 0 < age <= 120:
+            patient["age"] = age
 
     # -------------------------
     # Sex
@@ -455,7 +533,18 @@ def update_patient_entities(chat_id, text):
         "ankle",
         "hand",
         "wrist",
-        "finger"
+        "finger",
+        "both sides",
+        "one side",
+        "left side",
+        "right side",
+        "bilateral",
+        "temple",
+        "forehead",
+        "whole head",
+        "back of the head",
+        "behind my eyes",
+        "behind the eyes"
 
     ]
 

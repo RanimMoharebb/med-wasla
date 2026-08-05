@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 
+from cmath import phase
 import re
+from datetime import datetime, timezone
+
+from typer import prompt
 
 from core.router import keyword_route
 
@@ -9,7 +13,11 @@ from models import chat_sessions
 from core.loader import initialize_model
 from core.classifier import classify_question
 
-from memory.question_planner import get_next_missing_information
+from memory.question_planner import (
+    check_emergency,
+    get_symptom_exploration_guidance,
+    detect_question_topic
+)
 
 from preprocessing.gibberish import is_gibberish
 from preprocessing.spell_checker import clean_query
@@ -20,13 +28,16 @@ from preprocessing.write_action_guard import (
     get_requested_info,
     build_action_guard_message,
     is_unrecognized_offer_confirmation,
-    GENERIC_NO_ACTION_MESSAGE
+    GENERIC_NO_ACTION_MESSAGE,
+    _AFFIRMATIVE_RE
 )
 
 from memory.memory import (
     add_message,
     get_history,
     get_symptom_summary,
+    has_explained_causes,
+    mark_causes_explained,
     # is_patient_ready, will use later
     # update_patient_entities,
     # set_expected_answer
@@ -36,6 +47,11 @@ from memory.chitchat import get_chitchat_response
 
 from memory.session import (
     get_user,
+    set_expected_answer,
+    clear_expected_answer,
+    set_pending_login_offer,
+    is_pending_login_offer,
+    clear_pending_login_offer,
     set_last_specialist_name,
     get_last_specialist_name,
     mark_offer_fulfilled,
@@ -43,10 +59,14 @@ from memory.session import (
     set_last_question_type,
     get_last_question_type,
     set_waiting_for_reply,
-    # is_waiting_for_reply,
     assistant_is_waiting,
     set_conversation_state,
-    get_conversation_state
+    get_conversation_state,
+    set_phase,
+    get_phase,
+    COLLECTING_SYMPTOMS,
+    EMERGENCY,
+    ENOUGH_INFORMATION
 )
 
 from core.retrieval import retrieve_documents
@@ -68,6 +88,95 @@ from database.collections.specialist_queries import (
 from database.collections.appointment_queries import get_patient_upcoming_appointments
 
 from config import SIMILARITY_THRESHOLD, ENABLE_DATABASE
+
+
+# Defense-in-depth: the CLINICAL PLANNER block in build_combined_prompt
+# is internal metadata the model should never echo (see prompt_builder.py).
+# Defense-in-depth: the CLINICAL PLANNER block in build_combined_prompt
+# is internal metadata the model should never echo (see prompt_builder.py).
+# The prompt instructs it not to, but a local LLM can still slip
+# occasionally — this strips any leaked "Planner Decision" style block,
+# or other meta-commentary about the internal question-planning
+# mechanism, out of the final answer before it ever reaches the user.
+_PLANNER_LEAK_PATTERNS = [
+    re.compile(
+        r"planner\s*decision.*?required\s*follow-?up\s*question\s*:?\s*.*?(?:\n\s*\n|\Z)",
+        re.IGNORECASE | re.DOTALL
+    ),
+    # e.g. "The system will automatically append the next required
+    # field: 'age'" (with or without the quoted field name after it)
+    re.compile(
+        r"(?:the\s+)?system\s+(?:will|automatically)\s+(?:automatically\s+)?append[^\n.]*(?:required\s+field[^\n.]*)?[.:]?\s*(?:[\"'][a-z_]+[\"'])?\.?",
+        re.IGNORECASE
+    ),
+    # e.g. "Please note that I'll ask only ONE additional clinically
+    # relevant question if necessary, but for now, let's focus on..."
+    re.compile(
+        r"please note that i'?ll ask[^\n.]*\.", re.IGNORECASE
+    ),
+    re.compile(
+        r"next\s+required\s+field\s*:?\s*(?:[\"'][a-z_]+[\"'])?\.?", re.IGNORECASE
+    ),
+    # e.g. "That's not a medical question. However, ..." — self-
+    # contradictory hallucination, since this code path only runs when
+    # the message WAS already classified as medical/platform-related.
+    re.compile(
+        r"that'?s?\s+not\s+(?:a\s+)?medical\s+question\.?\s*", re.IGNORECASE
+    ),
+    re.compile(
+        r"this\s+(?:is|isn'?t|is\s+not)\s+(?:a\s+)?medical\s+question\.?\s*", re.IGNORECASE
+    ),
+    # e.g. "Here is a possible response from WaslaBot:" — meta-
+    # commentary narrating the model's own reply instead of just
+    # giving it.
+    re.compile(
+        r"here'?s?\s+(?:is\s+)?a\s+possible\s+response\s+from\s+wasla\s*bot\s*:?\s*", re.IGNORECASE
+    ),
+    # e.g. "Known symptoms:\n- headache\n- age: 26 years" — the model
+    # copying the internal KNOWN SYMPTOMS context block verbatim into
+    # its reply instead of using it silently. Stops before any line
+    # containing "?" so it can never consume a real follow-up question.
+    re.compile(
+        r"known symptoms:\s*\n(?:(?!.*\?)\s*-[^\n]*\n?)+", re.IGNORECASE
+    ),
+]
+
+
+def _strip_leaked_planner_block(answer):
+    if not answer:
+        return answer
+
+    cleaned = answer
+
+    for pattern in _PLANNER_LEAK_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+
+    # Collapse leftover blank lines created by the removals above
+    cleaned = re.sub(r"\n\s*\n\s*\n+", "\n\n", cleaned)
+
+    return cleaned.strip()
+
+
+def _strip_trailing_questions(answer):
+    """
+    Removes any trailing sentence(s) that end in '?' from the model's
+    answer. Used right before appending the guaranteed follow-up
+    question, so that even if the model disobeys the "don't ask a
+    question yourself" instruction, the patient doesn't see two
+    competing questions (e.g. "How old are you? Could you tell me
+    your age?").
+    """
+    if not answer:
+        return answer
+
+    # Split into sentences on ., !, ? followed by whitespace, keeping
+    # the delimiter attached to each sentence.
+    sentences = re.split(r"(?<=[.!?])\s+", answer.strip())
+
+    while sentences and sentences[-1].strip().endswith("?"):
+        sentences.pop()
+
+    return " ".join(sentences).strip()
 
 
 
@@ -235,18 +344,71 @@ def _build_top_rated_answer(specialists):
 
 
 _LIST_SPECIALISTS_RE = re.compile(
-    r"\blist\b|\bshow me\b|\branked?\b|\bsorted\b|\ball\b.{0,15}\b(doctors?|specialists?)\b",
+    r"\blist\b|\bshow me\b|\branked?\b|\bsorted\b"
+    r"|\ball\b.{0,15}\b(doctors?|specialists?|drs?|docs?)\b"
+    # plural noun ("drs"/"docs"/"doctors"/"specialists") anywhere near
+    # "top"/"highest"/"best" — e.g. "what are the top drs", "top rated
+    # doctors" — plural wording means the user wants several, not one.
+    r"|\b(top|highest|best)\b.{0,20}\b(doctors|specialists|drs|docs)\b"
+    r"|\b(doctors|specialists|drs|docs)\b.{0,20}\b(top|highest|best)\b"
+    # explicit plural correction — "i asked for doctors not doctor"
+    r"|\b(doctors|specialists|drs|docs)\b.{0,15}\bnot\b.{0,15}\b(a\s+|one\s+)?(doctor|specialist|dr)\b",
     re.IGNORECASE
 )
 
 
-def _build_specialist_list_answer(specialists):
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
+}
+
+_SHOW_ALL_RE = re.compile(r"\ball\b|\bevery\b|\bentire\b", re.IGNORECASE)
+
+_REQUESTED_COUNT_RE = re.compile(
+    r"\btop\s+(\d{1,2}|" + "|".join(_NUMBER_WORDS) + r")\b"
+    r"|\b(\d{1,2}|" + "|".join(_NUMBER_WORDS) + r")\s+top\b",
+    re.IGNORECASE
+)
+
+# Default shown when the user asks for a ranking/list without naming
+# a specific count ("what are the top drs...") — showing the entire
+# ~50+ specialist list for an unqualified "top" question isn't useful
+# and isn't what "top" means; only an explicit "all"/"every" request
+# should return everything.
+_DEFAULT_LIST_COUNT = 5
+
+
+def _requested_specialist_count(user_query):
+    """
+    Returns the number of specialists the user explicitly asked for
+    ("top 3", "3 top", "top five"), or None if no count was given.
+    """
+
+    match = _REQUESTED_COUNT_RE.search(user_query)
+
+    if not match:
+        return None
+
+    raw = match.group(1) or match.group(2)
+
+    if raw.isdigit():
+        return int(raw)
+
+    return _NUMBER_WORDS.get(raw.lower())
+
+
+def _build_specialist_list_answer(specialists, user_query=""):
     """
     "List the cardiologists from top to lowest" wants readable, scannable
     output, not one run-on sentence — reuse the same "- " bullet format
     used everywhere else in this pipeline (which the frontend already
     highlights consistently), built from the already-sorted data
     instead of asking the LLM to reproduce a ranked list faithfully.
+
+    Only returns as many entries as the user actually asked for ("top
+    3" -> 3), or a sensible default (5) when no count or "all"/"every"
+    was specified — showing the entire specialist list for an
+    unqualified "top" question isn't useful.
     """
 
     if not specialists:
@@ -254,12 +416,116 @@ def _build_specialist_list_answer(specialists):
 
     specialization = specialists[0].get("specialization") or "matching"
 
+    requested_count = _requested_specialist_count(user_query)
+
+    if requested_count:
+        shown = specialists[:requested_count]
+    elif _SHOW_ALL_RE.search(user_query):
+        shown = specialists
+    else:
+        shown = specialists[:_DEFAULT_LIST_COUNT]
+
     lines = "\n".join(
         f"- **{_display_name(doc.get('name') or 'Unknown')}** — rating {doc.get('rating', 0)}/5"
-        for doc in specialists
+        for doc in shown
     )
 
-    return f"Here are the {specialization} specialists, from highest to lowest rated:\n{lines}"
+    answer = f"Here are the {specialization} specialists, from highest to lowest rated:\n{lines}"
+
+    if len(shown) < len(specialists):
+        remaining = len(specialists) - len(shown)
+        answer += (
+            f"\n\n- There are {remaining} more {specialization} specialists "
+            f"— want to see more, or all of them?"
+        )
+
+    return answer
+
+
+def _appointment_datetime(appt):
+    """
+    Returns a timezone-aware datetime for an appointment record, or
+    None if the date is missing/unparseable. Handles both real
+    datetime objects and ISO-formatted strings from Mongo.
+    """
+
+    date = appt.get("date")
+
+    if isinstance(date, datetime):
+        return date if date.tzinfo else date.replace(tzinfo=timezone.utc)
+
+    if isinstance(date, str):
+        try:
+            parsed = datetime.fromisoformat(date.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    return None
+
+
+def _build_appointments_answer(appointments):
+    """
+    Builds the "what are my appointments" answer directly from the
+    data, splitting upcoming vs past by comparing each appointment's
+    actual date to now — instead of asking the LLM to reason about
+    dates from formatted text, which produced self-contradictory
+    answers like "you have no upcoming appointments... however, you
+    have an appointment on February 10th" in the same reply.
+    """
+
+    if not appointments:
+        return "You have no appointments on record yet."
+
+    now = datetime.now(timezone.utc)
+    upcoming, past, undated = [], [], []
+
+    for appt in appointments:
+        dt = _appointment_datetime(appt)
+
+        if dt is None:
+            undated.append(appt)
+        elif dt >= now:
+            upcoming.append(appt)
+        else:
+            past.append(appt)
+
+    def _line(appt):
+        name = _display_name(appt.get("specialistName") or "Unknown doctor")
+        dt = _appointment_datetime(appt)
+        date_text = dt.strftime("%d %B %Y at %I:%M %p") if dt else "an unspecified date"
+        appt_type = appt.get("type", "consultation")
+        status = appt.get("status")
+        status_text = f", {status}" if status else ""
+        return f"- **{name}** — {date_text} ({appt_type}{status_text})"
+
+    parts = []
+
+    if upcoming:
+        upcoming.sort(key=_appointment_datetime)
+        plural = "s" if len(upcoming) != 1 else ""
+        parts.append(
+            f"You have {len(upcoming)} upcoming appointment{plural}:\n"
+            + "\n".join(_line(a) for a in upcoming)
+        )
+    else:
+        parts.append("You have no upcoming appointments scheduled.")
+
+    if past:
+        past.sort(key=_appointment_datetime, reverse=True)
+        plural = "s" if len(past) != 1 else ""
+        parts.append(
+            f"Past appointment{plural} on record:\n"
+            + "\n".join(_line(a) for a in past)
+        )
+
+    if undated:
+        parts.append(
+            "Additional appointment record(s) with no clear date:\n"
+            + "\n".join(_line(a) for a in undated)
+        )
+
+    return "\n\n".join(parts)
 
 
 _COMPARISON_RE = re.compile(
@@ -312,8 +578,11 @@ def _handle_book_guidance(user_query, chat_id):
     # every single time this is asked.
     if _HOW_TO_BOOK_RE.search(user_query):
         return (
-            "To book an appointment: open the specialist's profile page and use "
-            "the **Book Appointment** button to pick an available date and time.\n\n"
+            "To book an appointment: open the specialist's profile page "
+            "(from the Doctors list) and use the **Book Appointment** "
+            "button there to pick an available date and time. You can "
+            "also reach your upcoming and past appointments from your "
+            "own Patient Profile page.\n\n"
             "- Which specialty are you looking for? I can help you find a doctor to book with."
         )
 
@@ -336,6 +605,20 @@ def _handle_book_guidance(user_query, chat_id):
 
     mentioned = _find_mentioned_specialist(user_query, matches)
 
+    # If the current message doesn't name anyone (e.g. a plain "yes
+    # please" confirming a prior "would you like the steps to book
+    # with Dr. X?" offer), fall back to whichever specialist is
+    # already the subject of this conversation, instead of treating it
+    # as a fresh, unscoped search and dumping the generic top-3 list.
+    if not mentioned:
+        last_name = get_last_specialist_name(chat_id)
+
+        if last_name:
+            mentioned = next(
+                (doc for doc in matches if doc.get("name") == last_name),
+                None
+            )
+
     if mentioned:
         name = mentioned.get("name", "the specialist")
         set_last_specialist_name(chat_id, name)
@@ -350,8 +633,11 @@ def _handle_book_guidance(user_query, chat_id):
             mark_offer_fulfilled(chat_id, name, "available_times")
 
         answer = (
-            f"Great choice — open **{_display_name(name)}**'s profile and use the "
-            f"**Book Appointment** button to pick a date and time.{slot_text}"
+            f"Great choice — open **{_display_name(name)}**'s profile "
+            f"(from the Doctors list) and use the **Book Appointment** "
+            f"button there to pick a date and time. You can also view "
+            f"this booking afterward from your own Patient Profile "
+            f"page.{slot_text}"
         )
 
         return answer + _next_offer_line(chat_id, name)
@@ -372,8 +658,10 @@ def _handle_book_guidance(user_query, chat_id):
 
     answer = (
         f"Here are the top-rated {specialization} specialists:\n{lines}\n\n"
-        "Once you've picked one, open their profile and use the **Book "
-        "Appointment** button to choose an available date and time."
+        "Once you've picked one, open their profile from the Doctors "
+        "list and use the **Book Appointment** button there to choose "
+        "an available date and time. You can also view your bookings "
+        "afterward from your own Patient Profile page."
     )
 
     return answer + _next_offer_line(chat_id, top_name)
@@ -449,7 +737,34 @@ def predict(user_query, chat_id="default_session"):
     # -------------------------
     # save user message
     # -------------------------
-    add_message(chat_id, "user", user_query)
+    add_message(chat_id, "user", user_query, extraction_text=processed_query)
+
+    # -------------------------
+    # login-offer follow-up — deterministic, no LLM call
+    # -------------------------
+    if is_pending_login_offer(chat_id):
+
+        clear_pending_login_offer(chat_id)
+
+        if _AFFIRMATIVE_RE.match(user_query.strip()):
+
+            answer = (
+                "To log in:\n\n"
+                "1. Open the Med-Wasla login page.\n"
+                "2. Enter your registered email and password.\n"
+                "3. Click Log In.\n\n"
+                "If you've forgotten your password, use the Forgot "
+                "Password option on the login page."
+            )
+
+            add_message(chat_id, "assistant", answer)
+            set_waiting_for_reply(chat_id, False)
+
+            return {
+                "answer": answer,
+                "sources": [],
+                "confidence": 1.0
+            }
 
     # -------------------------
     # sensitive info guard — refuse before touching the database at all
@@ -594,8 +909,18 @@ def predict(user_query, chat_id="default_session"):
     history = get_history(chat_id)
 
     is_followup = (
-        is_waiting_for_reply(chat_id)
-        and len(processed_query.split()) <= 12
+        len(processed_query.split()) <= 12
+        and (
+            is_waiting_for_reply(chat_id)
+            # A medical or database conversation naturally continues
+            # with related follow-ups ("do I need to do anything in
+            # the meantime?", "i said only top three why are you
+            # listing all?!") even after a reply that didn't end in a
+            # literal question — don't lose that context and fall back
+            # to the context-blind classifier just because
+            # assistant_is_waiting happened to be False.
+            or get_last_question_type(chat_id) in ("MEDICAL", "DATABASE")
+        )
     )
 
     # -------------------------
@@ -604,10 +929,10 @@ def predict(user_query, chat_id="default_session"):
 
     if is_followup:
 
-        question_type = get_last_question_type(chat_id)
+        question_type = keyword_route(processed_query)
 
         if question_type is None:
-            question_type = keyword_route(processed_query)
+            question_type = get_last_question_type(chat_id)
 
             if question_type is None:
                 question_type = classify_question(processed_query)
@@ -626,10 +951,18 @@ def predict(user_query, chat_id="default_session"):
 
     elif question_type == "DATABASE":
         set_conversation_state(chat_id, "DATABASE")
+        set_phase(chat_id, None)
+        clear_expected_answer(chat_id)
 
     elif question_type == "CHITCHAT":
         set_conversation_state(chat_id, "CHITCHAT")
+        set_phase(chat_id, None)
+        clear_expected_answer(chat_id)
 
+    elif question_type == "GENERAL":
+        set_phase(chat_id, None)
+        clear_expected_answer(chat_id)
+    
     if question_type != "GENERAL":
         set_last_question_type(chat_id, question_type)
         
@@ -668,7 +1001,8 @@ def predict(user_query, chat_id="default_session"):
             print("=" * 80 + "\n")
 
             answer = generate_response(prompt)
-        
+            answer = _strip_leaked_planner_block(answer)
+
         except Exception as e:
             print("Chitchat Error:", e)
             answer = "Hello! How can I help you today?"
@@ -714,12 +1048,14 @@ def predict(user_query, chat_id="default_session"):
     user_context = None
     context_specialist_name = None
     context_specialists = None
+    context_appointments = None
+    user_id = None
 
     if ENABLE_DATABASE:
         user_id = get_user(chat_id)
 
         try:
-            user_context, context_specialist_name, context_specialists = get_user_context(
+            user_context, context_specialist_name, context_specialists, context_appointments = get_user_context(
                 processed_query, user_id, chat_id
             )
         except Exception as e:
@@ -730,14 +1066,57 @@ def predict(user_query, chat_id="default_session"):
     # =========================
     if question_type == "DATABASE":
 
+        if not user_id:
+
+            answer = (
+                "Unfortunately, you need to be logged in to access "
+                "your account and platform data. Please log in to "
+                "view this information.\n\n"
+                "- Would you like to know how to log in?"
+            )
+
+            set_pending_login_offer(chat_id)
+
+            add_message(chat_id, "assistant", answer)
+            set_waiting_for_reply(chat_id, True)
+
+            return {
+                "answer": answer,
+                "sources": [],
+                "confidence": 1.0
+            }
+
+        # "what are my appointments" — build the upcoming/past split
+        # deterministically from the real dates, instead of letting the
+        # LLM reason about dates from formatted text (it has produced
+        # self-contradictory answers like "no upcoming appointments...
+        # however you have one on February 10th" in the same reply).
+        if context_appointments is not None:
+
+            answer = _build_appointments_answer(context_appointments)
+
+            add_message(chat_id, "assistant", answer)
+            set_waiting_for_reply(chat_id, assistant_is_waiting(answer))
+
+            return {
+                "answer": answer,
+                "sources": ["MongoDB"],
+                "confidence": 1.0
+            }
+
         # "list the cardiologists from top to lowest" — a readable
         # bulleted ranking, not a single pick. Checked before the
         # single-winner case below since "list ... top to lowest" would
         # otherwise also look like a "top rated" question.
         if context_specialists and _LIST_SPECIALISTS_RE.search(processed_query):
 
-            answer = _build_specialist_list_answer(context_specialists)
-            answer = _finalize_specialist_answer(answer, chat_id, context_specialist_name)
+            answer = _build_specialist_list_answer(context_specialists, processed_query)
+            list_top_name = context_specialists[0].get("name")
+
+            if list_top_name:
+                set_last_specialist_name(chat_id, list_top_name)
+
+            answer = _finalize_specialist_answer(answer, chat_id, list_top_name)
 
             add_message(chat_id, "assistant", answer)
             set_waiting_for_reply(chat_id, assistant_is_waiting(answer))
@@ -755,7 +1134,12 @@ def predict(user_query, chat_id="default_session"):
         if context_specialists and _TOP_RATED_RE.search(processed_query):
 
             answer = _build_top_rated_answer(context_specialists)
-            answer = _finalize_specialist_answer(answer, chat_id, context_specialist_name)
+            top_rated_name = context_specialists[0].get("name")
+
+            if top_rated_name:
+                set_last_specialist_name(chat_id, top_rated_name)
+
+            answer = _finalize_specialist_answer(answer, chat_id, top_rated_name)
 
             add_message(chat_id, "assistant", answer)
             set_waiting_for_reply(chat_id, assistant_is_waiting(answer))
@@ -778,7 +1162,9 @@ def predict(user_query, chat_id="default_session"):
 
         try:
             answer = generate_response(prompt)
+            answer = _strip_leaked_planner_block(answer)
             answer = _finalize_specialist_answer(answer, chat_id, context_specialist_name)
+
         except Exception as e:
             print("DB Error:", e)
             answer = "Sorry, I couldn't retrieve your account information."
@@ -855,45 +1241,105 @@ def predict(user_query, chat_id="default_session"):
     # =========================
     # FINAL PROMPT BUILD
     # =========================
-    
-    # Emergency detected
-    if planner and planner["priority"] == "emergency":
-        answer = (
-            "I'm concerned because you've reported symptoms that may require urgent medical attention.\n\n"
-            "Please seek emergency medical care immediately or go to the nearest emergency department. "
-            "If your symptoms become worse, call your local emergency services right away."
-        )
-        add_message(chat_id, "assistant", answer)
-        set_waiting_for_reply(chat_id, False)
-        return {
-            "answer": answer,
-            "sources": [],
-            "confidence": 1.0
-        }
-    
-    planner = get_next_missing_information(chat_id)
+
+    is_emergency = check_emergency(chat_id)
+
+    if is_emergency:
+        set_phase(chat_id, EMERGENCY)
+    else:
+        set_phase(chat_id, COLLECTING_SYMPTOMS)
 
     conversation_state = get_conversation_state(chat_id)
 
-    prompt = build_combined_prompt(
-        context_docs=filtered_docs,
-        user_query=user_query,
-        history_buffer=history,
-        symptom_summary=get_symptom_summary(chat_id),
-        conversation_state=conversation_state,
-        planner=planner,
-        user_context=user_context
-    )
+
+    phase = get_phase(chat_id)
+
+    if phase == EMERGENCY:
+
+        prompt = f"""
+    You are WaslaBot.
+
+    The patient has already reported emergency warning signs earlier in the conversation.
+
+    Your role now is to continue the conversation naturally.
+
+    Rules:
+
+    Your ONLY task is:
+
+    1. Briefly acknowledge the patient's latest reply.
+    2. Clearly explain that the reported symptoms require immediate emergency medical care.
+    3. Give 3–5 brief, practical first-aid or self-care recommendations that are safe to follow while waiting for medical care or traveling to the emergency department, formatted as a NUMBERED LIST, one per line — for example:
+    1. Avoid strenuous physical activity.
+    2. Sit upright if breathing is difficult.
+    3. Stay with another person if possible.
+    4. Do not drive yourself if symptoms are severe.
+    5. Call emergency services if symptoms worsen.
+    4. Do NOT write these recommendations as inline prose or a single paragraph — always as a numbered list like the example above.
+    5. Do NOT suggest home treatment instead of emergency care.
+    6. Do NOT discuss diagnoses in detail.
+    7. Do NOT ask further medical questions.
+    8. Keep the response under 8 sentences.
+
+    - First acknowledge the patient's latest reply in one short sentence.
+    - If they answered a previous question, briefly acknowledge the answer.
+    - Do NOT repeat the exact same wording as your previous response.
+    - Remind them that their symptoms may require immediate emergency medical care.
+    - Encourage them to go to the nearest emergency department or call local emergency services.
+    - Do NOT ask any more medical questions.
+    - Do NOT discuss diagnoses.
+    - Keep the reply under 5 sentences.
+    - Make each reply sound slightly different from the previous one.
+
+    Recent conversation:
+    {history}
+
+    Latest user message:
+    {user_query}
+    """
+
+    else:
+
+        prompt = build_combined_prompt(
+            context_docs=filtered_docs,
+            user_query=user_query,
+            history_buffer=history,
+            symptom_summary=get_symptom_summary(chat_id),
+            conversation_state=conversation_state,
+            symptom_guidance=get_symptom_exploration_guidance(chat_id),
+            causes_already_explained=has_explained_causes(chat_id),
+            user_context=user_context
+        )
+
     try:
         answer = generate_response(prompt)
+        answer = _strip_leaked_planner_block(answer)
+
+        if not is_emergency:
+            # No forced/guaranteed question anymore — the model fully
+            # drives what to ask. This just figures out what topic (if
+            # any) the model's own question was about, so a bare reply
+            # like "26" next turn can still be correctly attributed to
+            # age rather than left ambiguous.
+            topic = detect_question_topic(answer)
+
+            if topic:
+                set_expected_answer(chat_id, topic)
+            else:
+                clear_expected_answer(chat_id)
+
+            mark_causes_explained(chat_id)
 
     except Exception as e:
         print("Ollama Error:", e)
         answer = "Sorry, I couldn't generate a response."
-    
-    add_message(chat_id, "assistant", answer)
-    set_waiting_for_reply(chat_id, assistant_is_waiting(answer))
 
+    add_message(chat_id, "assistant", answer)
+
+    if phase == EMERGENCY:
+        set_waiting_for_reply(chat_id, False)
+    else:
+        set_waiting_for_reply(chat_id, assistant_is_waiting(answer))
 
     return {
         "answer": answer,

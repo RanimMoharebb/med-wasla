@@ -59,9 +59,9 @@ def classify_database_query(question: str):
     ]
 
     specialist_keywords = [
-        "doctor", "specialist", "nurse",
-        "cardiologist", "dermatologist",
-        "neurologist", "physician"
+        "doctor", "doctors", "specialist", "specialists", "nurse",
+        "cardiologist", "dermatologist", "neurologist", "physician",
+        "drs", "docs", "dr."
     ]
 
     review_keywords = [
@@ -71,6 +71,16 @@ def classify_database_query(question: str):
 
     if any(phrase in question for phrase in my_specialist_keywords):
         return "MY_SPECIALIST"
+
+    # "Dr. X's available appointment times" / "available times for
+    # cardiology" is asking about a SPECIALIST's open slots, not the
+    # patient's own booking history — even though both phrases contain
+    # the word "appointment". A patient asking about their own
+    # bookings says "my appointments"/"upcoming"/"cancel", never
+    # "available". Must be checked before the generic APPOINTMENTS
+    # keyword match below, since "appointment" alone is ambiguous.
+    if "available" in question:
+        return "SPECIALISTS"
 
     if any(word in question for word in appointment_keywords):
         return "APPOINTMENTS"

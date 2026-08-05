@@ -2,6 +2,7 @@ import re
 
 import models
 from preprocessing.spell_checker import spell
+from memory.session import get_expected_answer
 
 
 def _is_known_phrase_joined(word):
@@ -85,7 +86,17 @@ def is_gibberish(text, chat_id):
     # --------------------------------------------------
     if re.fullmatch(r"[0-9\s]+", text):
 
-        # Allow numbers if the bot previously asked for one.
+        # Allow numbers if the conversation is currently expecting a
+        # numeric answer (age, pain scale, temperature). This is the
+        # authoritative check: it comes from our own planner state,
+        # not from guessing at the LLM's exact question wording.
+        NUMERIC_EXPECTED_FIELDS = {"age", "pain_scale", "fever_temperature"}
+
+        if get_expected_answer(chat_id) in NUMERIC_EXPECTED_FIELDS:
+            return False
+
+        # Fallback: no expected-field state available (or it wasn't
+        # set) — infer from keywords in the bot's last message.
         history = models.chat_sessions.get(chat_id, [])
 
         if history:
@@ -105,13 +116,16 @@ def is_gibberish(text, chat_id):
                     "how long",
                     "how old",
                     "how much",
+                    "your age",
                     "scale",
                     "1 to 10",
                     "rate",
                     "days",
                     "weeks",
                     "months",
-                    "years"
+                    "years",
+                    "temperature",
+                    "degrees"
                 ]
 
                 if any(
