@@ -14,7 +14,7 @@ The platform has three services:
 
 ## Demo
 
-**Watch the Med-Wasla Demo:** [Click Here](https://drive.google.com/file/d/1xy31gF129iYFJyo-irO9U-6rE8fI8XHU/view)
+**Watch the Med-Wasla Demo:** [Click Here]([https://drive.google.com/file/d/1xy31gF129iYFJyo-irO9U-6rE8fI8XHU/view](https://drive.google.com/file/d/1f9fojk0umoSbk8JkUYSsosjIvX2H9p2f/view?usp=sharing)
 
 <!-- TODO: add screenshots and/or a demo video/GIF here -->
 <!-- Example:
