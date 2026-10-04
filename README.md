@@ -14,10 +14,10 @@ The platform has three services:
 
 ## Demo
 
-[Watch Med-Wasla Demo]([https://drive.google.com/file/d/1xy31gF129iYFJyo-irO9U-6rE8fI8XHU/view](https://drive.google.com/file/d/1f9fojk0umoSbk8JkUYSsosjIvX2H9p2f/view?usp=sharing))
+[Watch Med-Wasla Demo]([https://drive.google.com/file/d/1xy31gF129iYFJyo-irO9U-6rE8fI8XHU/view](https://drive.google.com/file/d/1f9fojk0umoSbk8JkUYSsosjIvX2H9p2f/view?usp=sharing)
 
 
-- **Live demo video:** [HireGate Demo](https://drive.google.com/file/d/1xy31gF129iYFJyo-irO9U-6rE8fI8XHU/view)
+- **Watch Med-Wasla Demo:** [HireGate Demo](https://drive.google.com/file/d/1xy31gF129iYFJyo-irO9U-6rE8fI8XHU/view)
 
 <!-- TODO: add screenshots and/or a demo video/GIF here -->
 <!-- Example:
